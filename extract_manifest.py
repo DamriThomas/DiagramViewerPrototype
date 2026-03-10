@@ -1,30 +1,36 @@
 """
 extract_manifest.py
 ───────────────────
-Generates label-manifest.json (and optionally a PNG) from a DXF file
-and a target label list.
+Generates label-manifest.json from a DXF file and a labels list.
+Includes full coordinate transform chain: DXF → SVG → PNG → Leaflet CRS.Simple
 
 Usage:
+    # SVG-only (no PNG yet) — produces manifest + debug SVG:
     python extract_manifest.py \
         --dxf drawing.dxf \
         --labels labels.txt \
-        --out manifest.json \
-        --export-png diagram.png \
-        --png-dpi 150 \
-        --layer-priority TAGS EQUIP ANNO \
-        --cluster-radius 50.0
+        --svg drawing.svg \
+        --transform transform.json \
+        --out label-manifest.json \
+        --debug-svg debug_labels.svg
 
-The manifest embeds dxf_extents + png_size so the viewer can compute
-the exact DXF-unit → pixel transform with no guesswork:
+    # With PNG (full Leaflet coords):
+    python extract_manifest.py \
+        --dxf drawing.dxf \
+        --labels labels.txt \
+        --svg drawing.svg \
+        --transform transform.json \
+        --out label-manifest.json \
+        --debug-svg debug_labels.svg
 
-    scale_x = png_width_px  / (dxf_extents.max_x - dxf_extents.min_x)
-    scale_y = png_height_px / (dxf_extents.max_y - dxf_extents.min_y)
-    px      = (dxf_x - dxf_extents.min_x) * scale_x
-    py      = png_height_px - (dxf_y - dxf_extents.min_y) * scale_y  # Y-flip
+    # Inline labels:
+    python extract_manifest.py \
+        --dxf drawing.dxf \
+        --labels-inline DV001 EV301 HV201 \
+        --transform transform.json
 
 Requirements:
-    pip install ezdxf
-    pip install "ezdxf[draw]" matplotlib   # only needed for --export-png
+    pip install ezdxf lxml
 """
 
 import argparse
@@ -38,15 +44,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1.  DXF TEXT EXTRACTION
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 1.  DXF EXTRACTION
+# ──────────────────────────────────────────────
 
 def extract_dxf_text_entities(dxf_path: str) -> list[dict]:
+    """Walk every TEXT and MTEXT entity in the DXF modelspace."""
     try:
         import ezdxf
     except ImportError:
-        sys.exit("ezdxf not installed.  Run:  pip install ezdxf")
+        sys.exit("ezdxf not installed. Run: pip install ezdxf")
 
     doc = ezdxf.readfile(dxf_path)
     msp = doc.modelspace()
@@ -54,30 +61,64 @@ def extract_dxf_text_entities(dxf_path: str) -> list[dict]:
     for entity in msp:
         etype = entity.dxftype()
         if etype == "TEXT":
-            r = _parse_text(entity)
-            if r: entities.append(r)
+            raw = _parse_text(entity)
+            if raw:
+                entities.append(raw)
         elif etype == "MTEXT":
-            r = _parse_mtext(entity)
-            if r: entities.append(r)
+            raw = _parse_mtext(entity)
+            if raw:
+                entities.append(raw)
     return entities
+
+
+def extract_dxf_extents(dxf_path: str) -> dict | None:
+    """Scan entity bounding box for drawing extents."""
+    try:
+        import ezdxf
+        from ezdxf.bbox import extents as bbox_extents
+    except ImportError:
+        sys.exit("ezdxf not installed. Run: pip install ezdxf")
+
+    doc  = ezdxf.readfile(dxf_path)
+    msp  = doc.modelspace()
+    bbox = bbox_extents(msp)
+
+    if bbox is None or not bbox.has_data:
+        return None
+
+    x_min, y_min = bbox.extmin.x, bbox.extmin.y
+    x_max, y_max = bbox.extmax.x, bbox.extmax.y
+    return {
+        "x_min": round(x_min, 6), "y_min": round(y_min, 6),
+        "x_max": round(x_max, 6), "y_max": round(y_max, 6),
+        "width":  round(x_max - x_min, 6),
+        "height": round(y_max - y_min, 6),
+    }
 
 
 def _parse_text(e) -> dict | None:
     try:
         text = (e.dxf.text or "").strip()
-        if not text: return None
-        ins = e.dxf.insert
+        if not text:
+            return None
+        insert   = e.dxf.insert
+        rotation = getattr(e.dxf, "rotation", 0.0) or 0.0
+        height   = getattr(e.dxf, "height", 0.0) or 0.0
+        layer    = getattr(e.dxf, "layer", "0") or "0"
+        style    = getattr(e.dxf, "style", "STANDARD") or "STANDARD"
+        halign   = getattr(e.dxf, "halign", 0)
+        valign   = getattr(e.dxf, "valign", 0)
         return {
             "handle":   e.dxf.handle,
             "type":     "TEXT",
             "text":     text,
-            "layer":    getattr(e.dxf, "layer",    "0")        or "0",
-            "insert":   [round(ins.x, 4), round(ins.y, 4)],
-            "rotation": round(getattr(e.dxf, "rotation", 0.0) or 0.0, 4),
-            "height":   round(getattr(e.dxf, "height",   0.0) or 0.0, 4),
-            "style":    getattr(e.dxf, "style",   "STANDARD") or "STANDARD",
-            "halign":   getattr(e.dxf, "halign",  0),
-            "valign":   getattr(e.dxf, "valign",  0),
+            "layer":    layer,
+            "insert":   [round(insert.x, 4), round(insert.y, 4)],
+            "rotation": round(rotation, 4),
+            "height":   round(height, 4),
+            "style":    style,
+            "halign":   halign,
+            "valign":   valign,
         }
     except Exception:
         return None
@@ -85,145 +126,204 @@ def _parse_text(e) -> dict | None:
 
 def _parse_mtext(e) -> dict | None:
     try:
-        text = e.plain_mtext().strip()
-        if not text: return None
-        ins = e.dxf.insert
+        raw_text = e.plain_mtext().strip()
+        if not raw_text:
+            return None
+        insert   = e.dxf.insert
+        rotation = math.degrees(getattr(e.dxf, "rotation", 0.0) or 0.0)
+        height   = getattr(e.dxf, "char_height", 0.0) or 0.0
+        layer    = getattr(e.dxf, "layer", "0") or "0"
         return {
             "handle":   e.dxf.handle,
             "type":     "MTEXT",
-            "text":     text,
-            "layer":    getattr(e.dxf, "layer", "0") or "0",
-            "insert":   [round(ins.x, 4), round(ins.y, 4)],
-            "rotation": round(math.degrees(getattr(e.dxf, "rotation", 0.0) or 0.0), 4),
-            "height":   round(getattr(e.dxf, "char_height", 0.0) or 0.0, 4),
-            "style":    None, "halign": None, "valign": None,
+            "text":     raw_text,
+            "layer":    layer,
+            "insert":   [round(insert.x, 4), round(insert.y, 4)],
+            "rotation": round(rotation, 4),
+            "height":   round(height, 4),
+            "style":    None,
+            "halign":   None,
+            "valign":   None,
         }
     except Exception:
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2.  DXF EXTENTS
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 2.  SVG TEXT EXTRACTION  (optional)
+# ──────────────────────────────────────────────
 
-def get_dxf_extents(dxf_path: str) -> dict | None:
+def extract_svg_text_bboxes(svg_path: str) -> list[dict]:
     """
-    Return model-space extents.  Tries header EXTMIN/EXTMAX first,
-    then falls back to scanning entity inserts.
+    Parse SVG <text> elements.
+    ezdxf SVGBackend produces real <text> nodes (unlike matplotlib).
     """
     try:
-        import ezdxf
-        doc = ezdxf.readfile(dxf_path)
+        from lxml import etree
+    except ImportError:
+        print("Warning: lxml not installed — SVG text matching skipped.", file=sys.stderr)
+        return []
 
-        extmin = doc.header.get("$EXTMIN")
-        extmax = doc.header.get("$EXTMAX")
-        sentinel = 1e20
-        if (extmin and extmax
-                and abs(extmin.x) < sentinel and abs(extmax.x) < sentinel
-                and extmax.x > extmin.x and extmax.y > extmin.y):
-            return {
-                "min_x": round(extmin.x, 4), "min_y": round(extmin.y, 4),
-                "max_x": round(extmax.x, 4), "max_y": round(extmax.y, 4),
-                "source": "header",
-            }
+    NS = "http://www.w3.org/2000/svg"
+    tree = etree.parse(svg_path)
+    root = tree.getroot()
 
-        # Fallback: scan inserts
-        xs, ys = [], []
-        for e in doc.modelspace():
-            try:
-                ins = e.dxf.insert
-                xs.append(ins.x); ys.append(ins.y)
-            except Exception:
-                pass
-        if xs:
-            return {
-                "min_x": round(min(xs), 4), "min_y": round(min(ys), 4),
-                "max_x": round(max(xs), 4), "max_y": round(max(ys), 4),
-                "source": "entity_scan",
-            }
-    except Exception:
-        pass
+    results = []
+    for idx, el in enumerate(root.iter(f"{{{NS}}}text")):
+        content = "".join(el.itertext()).strip()
+        if not content:
+            continue
+        x         = _float_attr(el, "x")
+        y         = _float_attr(el, "y")
+        font_size = _parse_font_size(el)
+        transform = el.get("transform", "") or _inherit_transform(el)
+        approx_w  = round(len(content) * font_size * 0.6, 2) if font_size else None
+        approx_h  = round(font_size * 1.2, 2) if font_size else None
+        results.append({
+            "element_index": idx,
+            "text":          content,
+            "x": x, "y": y,
+            "font_size":     font_size,
+            "transform":     transform,
+            "bbox": {"x": x, "y": y, "width": approx_w, "height": approx_h}
+                    if (x is not None and y is not None) else None,
+        })
+    return results
+
+
+def _float_attr(el, attr) -> float | None:
+    v = el.get(attr)
+    if v is None:
+        return None
+    try:
+        return round(float(v), 4)
+    except ValueError:
+        return None
+
+
+def _parse_font_size(el) -> float | None:
+    fs = el.get("font-size")
+    if fs:
+        try:
+            return float(re.sub(r"[^\d.]", "", fs))
+        except ValueError:
+            pass
+    m = re.search(r"font-size\s*:\s*([\d.]+)", el.get("style", ""))
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
     return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3.  PROXIMITY CLUSTERING  (handles split labels like "FV" + "101")
-# ──────────────────────────────────────────────────────────────────────────────
+def _inherit_transform(el):
+    parent = el.getparent()
+    while parent is not None:
+        t = parent.get("transform")
+        if t:
+            return t
+        parent = parent.getparent()
+    return ""
 
-def build_proximity_clusters(entities: list[dict], radius: float) -> list[dict]:
+
+# ──────────────────────────────────────────────
+# 3.  COORDINATE TRANSFORMS
+#
+#  Spaces:
+#    DXF     — unitless CAD, Y-up, origin bottom-left
+#    SVG     — mm (ezdxf viewBox), Y-down, origin top-left
+#    PNG     — pixels, Y-down (only available after external PNG render)
+#    Leaflet — CRS.Simple: lat=-png_y, lng=png_x
+# ──────────────────────────────────────────────
+
+class CoordTransform:
     """
-    Greedy single-linkage clustering of TEXT/MTEXT entities within `radius`
-    DXF units of each other.  Returns only clusters with 2+ fragments.
+    Coordinate transform chain built from transform.json.
+
+    transform.json is written by render_svg.py.
+    If png block is present, Leaflet coords are also available.
     """
-    remaining = list(entities)
-    clusters  = []
 
-    while remaining:
-        seed   = remaining.pop(0)
-        group  = [seed]
-        changed = True
-        while changed:
-            changed = False
-            next_remaining = []
-            for e in remaining:
-                if any(_dist(e, g) <= radius for g in group):
-                    group.append(e)
-                    changed = True
-                else:
-                    next_remaining.append(e)
-            remaining = next_remaining
+    def __init__(self, t: dict):
+        self.dxf      = t["dxf"]
+        self.svg      = t["svg"]
+        self.has_png  = "png" in t and t.get("scale_x") is not None
+        self.scale_x  = t.get("scale_x")
+        self.scale_y  = t.get("scale_y")
+        self.png_w    = t["png"]["width_px"]  if self.has_png else None
+        self.png_h    = t["png"]["height_px"] if self.has_png else None
 
-        if len(group) < 2:
-            continue
+    def dxf_to_svg(self, dxf_x: float, dxf_y: float) -> tuple[float, float]:
+        """
+        DXF coords → SVG viewBox coords (mm).
+        Y is flipped: DXF Y-up → SVG Y-down.
+        Also accounts for viewbox_x/y offset (ezdxf may not start at 0,0).
+        """
+        nx =  (dxf_x - self.dxf["x_min"]) / self.dxf["width"]
+        ny = 1.0 - (dxf_y - self.dxf["y_min"]) / self.dxf["height"]
+        vb_x = self.svg["viewbox_x"]
+        vb_y = self.svg["viewbox_y"]
+        sx = vb_x + nx * self.svg["viewbox_w"]
+        sy = vb_y + ny * self.svg["viewbox_h"]
+        return round(sx, 4), round(sy, 4)
 
-        # Sort top-to-bottom then left-to-right
-        group.sort(key=lambda e: (-e["insert"][1], e["insert"][0]))
-        combined = " ".join(e["text"] for e in group)
-        cx = sum(e["insert"][0] for e in group) / len(group)
-        cy = sum(e["insert"][1] for e in group) / len(group)
+    def dxf_to_png(self, dxf_x: float, dxf_y: float) -> tuple[float, float]:
+        """DXF coords → PNG pixel coords. Requires PNG data in transform.json."""
+        if not self.has_png:
+            raise ValueError("PNG dimensions not in transform.json — add png block first")
+        px =  (dxf_x - self.dxf["x_min"]) * self.scale_x
+        py = self.png_h - (dxf_y - self.dxf["y_min"]) * self.scale_y
+        return round(px, 4), round(py, 4)
 
-        clusters.append({
-            "combined_text": combined,
-            "combined_nospace": re.sub(r"\s+", "", combined).upper(),
-            "centroid":  [round(cx, 4), round(cy, 4)],
-            "layer":     group[0]["layer"],
-            "fragments": group,
-        })
+    def dxf_to_leaflet(self, dxf_x: float, dxf_y: float) -> dict | None:
+        """DXF coords → Leaflet CRS.Simple {lat, lng}. Requires PNG data."""
+        if not self.has_png:
+            return None
+        px, py = self.dxf_to_png(dxf_x, dxf_y)
+        return {"lat": round(-py, 4), "lng": round(px, 4)}
 
-    return clusters
+    def leaflet_bounds(self) -> list | None:
+        if not self.has_png:
+            return None
+        return [[-self.png_h, 0], [0, self.png_w]]
+
+    def to_dict(self) -> dict:
+        d = {
+            "dxf": self.dxf,
+            "svg": self.svg,
+        }
+        if self.has_png:
+            d["png"]            = {"width_px": self.png_w, "height_px": self.png_h}
+            d["scale_x"]        = self.scale_x
+            d["scale_y"]        = self.scale_y
+            d["leaflet_bounds"] = self.leaflet_bounds()
+        return d
 
 
-def _dist(a: dict, b: dict) -> float:
-    ax, ay = a["insert"]; bx, by = b["insert"]
-    return math.hypot(ax - bx, ay - by)
-
-
-def find_cluster_match(label: str, clusters: list[dict]) -> dict | None:
-    norm = re.sub(r"\s+", "", label).upper()
-    best = None
-    for c in clusters:
-        if norm in c["combined_nospace"]:
-            if best is None or len(c["combined_nospace"]) < len(best["combined_nospace"]):
-                best = c
-    return best
-
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # 4.  MATCHING
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
 def build_dxf_index(entities: list[dict]) -> dict[str, list[dict]]:
-    idx = defaultdict(list)
+    index = defaultdict(list)
     for e in entities:
-        idx[e["text"].strip()].append(e)
-    return dict(idx)
+        index[e["text"].strip()].append(e)
+    return dict(index)
 
 
-def pick_best(matches: list[dict], layer_priority: list[str]) -> tuple[dict, bool]:
-    if len(matches) == 1:
+def build_svg_index(svg_entities: list[dict]) -> dict[str, list[dict]]:
+    index = defaultdict(list)
+    for e in svg_entities:
+        index[e["text"].strip()].append(e)
+    return dict(index)
+
+
+def pick_best_dxf_match(matches, layer_priority) -> tuple[dict, bool]:
+    is_dup = len(matches) > 1
+    if not is_dup:
         return matches[0], False
-    priority_upper = [l.upper() for l in layer_priority]
-    for layer in priority_upper:
+    for layer in [l.upper() for l in layer_priority]:
         for m in matches:
             if m["layer"].upper() == layer:
                 return m, True
@@ -233,312 +333,348 @@ def pick_best(matches: list[dict], layer_priority: list[str]) -> tuple[dict, boo
 def match_labels(
     target_labels:  list[str],
     dxf_index:      dict,
+    svg_index:      dict,
     layer_priority: list[str],
-    clusters:       list[dict],
-) -> tuple[dict, dict]:
-    confirmed  = {}
-    potentials = {}
-
+    transform:      CoordTransform | None,
+) -> dict:
+    labels = {}
     for label in target_labels:
-        key = label.strip()
+        key         = label.strip()
+        dxf_matches = dxf_index.get(key, [])
+        svg_matches = svg_index.get(key, [])
 
-        # 1. Exact
-        matches = dxf_index.get(key, [])
-        if matches:
-            best, is_dup = pick_best(matches, layer_priority)
-            confirmed[key] = _build_entry(key, best, is_dup, matches, "exact")
-            continue
-
-        # 2. Case-insensitive
-        ci = key.upper()
-        ci_matches = [e for k, v in dxf_index.items() if k.upper() == ci for e in v]
-        if ci_matches:
-            best, is_dup = pick_best(ci_matches, layer_priority)
-            confirmed[key] = _build_entry(key, best, is_dup, ci_matches, "fuzzy")
-            continue
-
-        # 3. Proximity cluster
-        cluster = find_cluster_match(key, clusters)
-        if cluster:
-            potentials[key] = _build_cluster_entry(key, cluster)
-            continue
-
-        # 4. Not found
-        confirmed[key] = {
-            "text": key, "found": False, "duplicate": False,
-            "match_type": "none", "dxf": None, "all_dxf_matches": [],
-        }
-
-    return confirmed, potentials
+        if not dxf_matches:
+            # Case-insensitive fuzzy fallback
+            ci_key     = key.upper()
+            ci_matches = [
+                e for k, elist in dxf_index.items()
+                if k.upper() == ci_key for e in elist
+            ]
+            if ci_matches:
+                best, is_dup = pick_best_dxf_match(ci_matches, layer_priority)
+                labels[key]  = _build_entry(key, best, svg_matches, is_dup,
+                                            ci_matches if is_dup else None,
+                                            fuzzy_match=True, transform=transform)
+            else:
+                labels[key] = _not_found_entry(key)
+        else:
+            best, is_dup = pick_best_dxf_match(dxf_matches, layer_priority)
+            labels[key]  = _build_entry(key, best, svg_matches, is_dup,
+                                        dxf_matches if is_dup else None,
+                                        fuzzy_match=False, transform=transform)
+    return labels
 
 
-def _build_entry(key, match, is_dup, all_matches, match_type) -> dict:
-    entry = {
-        "text":       key,
-        "found":      True,
-        "duplicate":  is_dup,
-        "match_type": match_type,
-        "dxf": {
-            "handle":   match["handle"],
-            "type":     match["type"],
-            "insert":   match["insert"],
-            "rotation": match["rotation"],
-            "height":   match["height"],
-            "layer":    match["layer"],
-            "style":    match["style"],
-            "halign":   match["halign"],
-            "valign":   match["valign"],
-        },
-        "all_dxf_matches": [
-            {"handle": m["handle"], "layer": m["layer"], "insert": m["insert"]}
-            for m in all_matches
-        ] if is_dup else [],
+def _not_found_entry(key: str) -> dict:
+    return {
+        "text": key, "found": False, "duplicate": False,
+        "fuzzy_match": False, "dxf": None, "svg": None,
+        "coords": None, "all_dxf_matches": [], "meta": {},
     }
+
+
+def _build_entry(key, dxf_match, svg_matches, is_duplicate,
+                 all_dxf, fuzzy_match, transform) -> dict:
+    svg_primary = svg_matches[0] if svg_matches else None
+    dxf_x, dxf_y = dxf_match["insert"]
+
+    # ── Coordinate transforms ──────────────────────────────────────────
+    coords = None
+    if transform is not None:
+        svg_xy  = transform.dxf_to_svg(dxf_x, dxf_y)
+        leaflet = transform.dxf_to_leaflet(dxf_x, dxf_y)  # None if no PNG
+        coords  = {
+            "dxf":     {"x": dxf_x,     "y": dxf_y},
+            "svg":     {"x": svg_xy[0],  "y": svg_xy[1]},
+            "leaflet": leaflet,
+        }
+        if transform.has_png:
+            png_xy          = transform.dxf_to_png(dxf_x, dxf_y)
+            coords["png"]   = {"x": png_xy[0], "y": png_xy[1]}
+
+    entry = {
+        "text":        key,
+        "found":       True,
+        "duplicate":   is_duplicate,
+        "fuzzy_match": fuzzy_match,
+        "dxf": {
+            "handle":   dxf_match["handle"],
+            "type":     dxf_match["type"],
+            "insert":   dxf_match["insert"],
+            "rotation": dxf_match["rotation"],
+            "height":   dxf_match["height"],
+            "layer":    dxf_match["layer"],
+            "style":    dxf_match["style"],
+            "halign":   dxf_match["halign"],
+            "valign":   dxf_match["valign"],
+        },
+        "svg": {
+            "element_index": svg_primary["element_index"],
+            "bbox":          svg_primary["bbox"],
+            "transform":     svg_primary["transform"],
+            "font_size":     svg_primary["font_size"],
+        } if svg_primary else None,
+        "coords": coords,
+        "meta":   {},
+    }
+
+    entry["all_dxf_matches"] = [
+        {"handle": m["handle"], "layer": m["layer"], "insert": m["insert"]}
+        for m in all_dxf
+    ] if (is_duplicate and all_dxf) else []
+
     return entry
 
 
-def _build_cluster_entry(key, cluster) -> dict:
-    frag = cluster["fragments"][0]
-    return {
-        "text":         key,
-        "found":        True,
-        "duplicate":    False,
-        "match_type":   "proximity_cluster",
-        "needs_review": True,
-        "cluster": {
-            "combined_text":  cluster["combined_text"],
-            "centroid":       cluster["centroid"],
-            "layer":          cluster["layer"],
-            "fragment_count": len(cluster["fragments"]),
-            "fragments": [
-                {"handle": f["handle"], "text": f["text"],
-                 "insert": f["insert"], "layer": f["layer"]}
-                for f in cluster["fragments"]
-            ],
-        },
-        "dxf": {
-            "handle":   frag["handle"],
-            "type":     frag["type"],
-            "insert":   cluster["centroid"],
-            "rotation": frag["rotation"],
-            "height":   frag["height"],
-            "layer":    cluster["layer"],
-            "style":    frag["style"],
-            "halign":   frag["halign"],
-            "valign":   frag["valign"],
-        },
-        "all_dxf_matches": [],
-    }
+# ──────────────────────────────────────────────
+# 5.  HITBOXES  (flat Leaflet-ready list)
+# ──────────────────────────────────────────────
+
+def build_hitboxes(labels: dict) -> list[dict]:
+    """Flat list consumed directly by the Leaflet viewer."""
+    hitboxes = []
+    for key, entry in labels.items():
+        if not entry["found"] or entry["coords"] is None:
+            continue
+        leaflet = entry["coords"].get("leaflet")
+        hitboxes.append({
+            "label":   entry["text"],
+            "found":   True,
+            "dxf":     entry["coords"]["dxf"],
+            "svg":     entry["coords"]["svg"],
+            "leaflet": leaflet,   # None until PNG dims are added to transform.json
+            "meta": {
+                "layer":       entry["dxf"]["layer"],
+                "type":        entry["dxf"]["type"],
+                "handle":      entry["dxf"]["handle"],
+                "duplicate":   entry["duplicate"],
+                "fuzzy_match": entry["fuzzy_match"],
+            },
+        })
+    return hitboxes
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5.  PNG EXPORT
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 6.  DEBUG SVG
+# ──────────────────────────────────────────────
 
-def export_png(dxf_path: str, out_png: str, dpi: int = 150) -> dict | None:
+def write_debug_svg(svg_path: str, labels: dict, output_path: str,
+                    transform: CoordTransform) -> None:
     """
-    Render the DXF modelspace to a PNG using ezdxf's Matplotlib backend.
-
-    Returns a dict with the PNG pixel dimensions and the DXF extents used
-    for the render, so the viewer can compute an exact pixel transform:
-
-        px = (dxf_x - render_extents.min_x) * scale_x
-        py = png_h  - (dxf_y - render_extents.min_y) * scale_y   # Y-flip
-
-    where scale_x = png_w / (max_x - min_x),  scale_y = png_h / (max_y - min_y)
+    Inject red dots at each label's SVG viewBox coordinates.
+    Open in a browser — dots should sit on the matching text entities.
+    Uses SVG coords so no PNG required.
     """
-    try:
-        import ezdxf
-        from ezdxf.addons.drawing import RenderContext, Frontend
-        from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("⚠  PNG export requires ezdxf[draw] + matplotlib.")
-        print("   Run:  pip install 'ezdxf[draw]' matplotlib")
-        return None
+    import xml.etree.ElementTree as ET
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+    ns   = "http://www.w3.org/2000/svg"
 
-    print(f"[PNG] Rendering {dxf_path} at {dpi} DPI …")
+    vb_w = transform.svg["viewbox_w"]
+    vb_h = transform.svg["viewbox_h"]
+    dot_r      = round(vb_w * 0.003, 2)
+    font_size  = round(vb_h * 0.012, 2)
+    label_dx   = round(vb_w * 0.004, 4)
 
-    doc = ezdxf.readfile(dxf_path)
-    msp = doc.modelspace()
+    for key, entry in labels.items():
+        if not entry["found"] or entry["coords"] is None:
+            continue
 
-    # Get extents for the render (same logic as get_dxf_extents)
-    extents = get_dxf_extents(dxf_path)
-    if not extents:
-        print("⚠  Could not determine DXF extents — PNG output may be cropped.")
+        sx = entry["coords"]["svg"]["x"]
+        sy = entry["coords"]["svg"]["y"]
 
-    fig = plt.figure()
-    ax  = fig.add_axes([0, 0, 1, 1])
-    ax.set_aspect("equal")
-    ax.axis("off")
+        dot = ET.SubElement(root, f"{{{ns}}}circle")
+        dot.set("cx",           str(sx))
+        dot.set("cy",           str(sy))
+        dot.set("r",            str(dot_r))
+        dot.set("fill",         "red")
+        dot.set("opacity",      "0.8")
+        dot.set("stroke",       "white")
+        dot.set("stroke-width", str(round(dot_r * 0.2, 2)))
 
-    ctx      = RenderContext(doc)
-    backend  = MatplotlibBackend(ax)
-    frontend = Frontend(ctx, backend)
-    frontend.draw_layout(msp)
+        lbl = ET.SubElement(root, f"{{{ns}}}text")
+        lbl.set("x",         str(round(sx + label_dx, 4)))
+        lbl.set("y",         str(round(sy + label_dx, 4)))
+        lbl.set("font-size", str(font_size))
+        lbl.set("fill",      "red")
+        lbl.text = key
 
-    # Fit the axes tightly to the content
-    ax.autoscale()
-    fig.set_facecolor("white")
-
-    out_path = Path(out_png)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(out_path), dpi=dpi, bbox_inches="tight",
-                pad_inches=0, facecolor="white")
-    plt.close(fig)
-
-    # Read back actual pixel dimensions
-    try:
-        from PIL import Image
-        with Image.open(str(out_path)) as im:
-            png_w, png_h = im.size
-    except ImportError:
-        # Fall back to matplotlib figure size × dpi
-        w_in, h_in = fig.get_size_inches()
-        png_w = round(w_in * dpi)
-        png_h = round(h_in * dpi)
-
-    size_kb = out_path.stat().st_size / 1024
-    print(f"[PNG] Written: {out_path}  ({png_w}×{png_h}px, {size_kb:.0f} KB)")
-
-    return {
-        "path":    str(out_path),
-        "width":   png_w,
-        "height":  png_h,
-        "dpi":     dpi,
-    }
+    tree.write(output_path, xml_declaration=True, encoding="unicode")
+    print(f"Debug SVG written: {output_path}")
+    print("  → Open in browser — red dots should sit on matching text entities.")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 6.  MANIFEST ASSEMBLY
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 7.  MANIFEST ASSEMBLY
+# ──────────────────────────────────────────────
 
 def build_manifest(
     dxf_path:       str,
+    svg_path:       str | None,
     target_labels:  list[str],
     layer_priority: list[str],
-    cluster_radius: float,
-    png_info:       dict | None = None,
+    transform:      CoordTransform | None,
 ) -> dict:
     print(f"[1/4] Reading DXF: {dxf_path}")
     dxf_entities = extract_dxf_text_entities(dxf_path)
-    dxf_extents  = get_dxf_extents(dxf_path)
     print(f"      → {len(dxf_entities)} text entities found")
-    if dxf_extents:
-        print(f"      → extents X {dxf_extents['min_x']}..{dxf_extents['max_x']}  "
-              f"Y {dxf_extents['min_y']}..{dxf_extents['max_y']}  ({dxf_extents['source']})")
 
-    print(f"[2/4] Building proximity clusters (radius={cluster_radius})…")
-    clusters = build_proximity_clusters(dxf_entities, cluster_radius)
-    print(f"      → {len(clusters)} multi-fragment clusters")
+    svg_entities = []
+    if svg_path:
+        print(f"[2/4] Reading SVG: {svg_path}")
+        svg_entities = extract_svg_text_bboxes(svg_path)
+        print(f"      → {len(svg_entities)} <text> elements found")
+        if not svg_entities:
+            print("      (no <text> elements — SVG may use outlined paths, DXF coords used instead)")
+    else:
+        print("[2/4] No SVG provided — skipping SVG text extraction")
 
-    print(f"[3/4] Matching {len(target_labels)} labels…")
+    print(f"[3/4] Matching {len(target_labels)} labels...")
     dxf_index = build_dxf_index(dxf_entities)
-    confirmed, potentials = match_labels(target_labels, dxf_index, layer_priority, clusters)
+    svg_index = build_svg_index(svg_entities)
+    labels    = match_labels(target_labels, dxf_index, svg_index,
+                             layer_priority, transform)
 
-    exact   = sum(1 for v in confirmed.values() if v["found"] and v["match_type"] == "exact")
-    fuzzy   = sum(1 for v in confirmed.values() if v["found"] and v["match_type"] == "fuzzy")
-    missing = sum(1 for v in confirmed.values() if not v["found"])
-    dups    = sum(1 for v in confirmed.values() if v.get("duplicate"))
+    found      = sum(1 for v in labels.values() if v["found"])
+    not_found  = sum(1 for v in labels.values() if not v["found"])
+    duplicates = sum(1 for v in labels.values() if v["duplicate"])
+    fuzzy      = sum(1 for v in labels.values() if v.get("fuzzy_match"))
+    has_coords = sum(1 for v in labels.values() if v.get("coords") is not None)
+    has_leaflet= sum(1 for v in labels.values()
+                     if v.get("coords") and v["coords"].get("leaflet"))
+
+    hitboxes = build_hitboxes(labels)
 
     manifest = {
-        "version":        "2.0",
+        "version":        "1.2",
         "source_dxf":     os.path.basename(dxf_path),
+        "source_svg":     os.path.basename(svg_path) if svg_path else None,
         "generated_at":   datetime.now(timezone.utc).isoformat(),
         "layer_priority": layer_priority,
-        "cluster_radius": cluster_radius,
-        # Coordinate reference — viewer uses these to place hitboxes on the PNG
-        "dxf_extents":    dxf_extents,
-        "png":            png_info,   # { width, height, dpi } or None
-        "labels":         confirmed,
-        "potential_matches": potentials,
+        "transform":      transform.to_dict() if transform else None,
+        "hitboxes":       hitboxes,
+        "labels":         labels,
         "stats": {
-            "total_searched":            len(target_labels),
-            "exact_matches":             exact,
-            "fuzzy_matches":             fuzzy,
-            "proximity_cluster_matches": len(potentials),
-            "not_found":                 missing,
-            "duplicate_matches":         dups,
+            "total_searched":    len(target_labels),
+            "found":             found,
+            "not_found":         not_found,
+            "duplicate_matches": duplicates,
+            "fuzzy_matches":     fuzzy,
+            "with_coords":       has_coords,
+            "with_leaflet":      has_leaflet,
         },
     }
 
-    print(f"[4/4] Done — exact={exact}  fuzzy={fuzzy}  "
-          f"cluster={len(potentials)}  not_found={missing}  dups={dups}")
+    print(f"[4/4] Done.")
+    print(f"      found={found}  not_found={not_found}  duplicates={duplicates}"
+          f"  fuzzy={fuzzy}  coords={has_coords}  leaflet={has_leaflet}")
+
+    if has_leaflet == 0 and transform and not transform.has_png:
+        print()
+        print("  ℹ  No Leaflet coords yet — add PNG dimensions to transform.json")
+        print("     then re-run to get hitboxes.leaflet populated.")
+
     return manifest
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 7.  CLI
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 8.  CLI
+# ──────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Generate label-manifest.json (+ optional PNG) from a DXF file"
+        description="Generate label-manifest.json from DXF + labels list."
     )
-    p.add_argument("--dxf",  required=True, help="Path to .dxf file")
-    p.add_argument("--out",  default="label-manifest.json")
+    p.add_argument("--dxf",       required=True, help="Path to .dxf file")
+    p.add_argument("--svg",       default=None,  help="Path to .svg file (from render_svg.py)")
+    p.add_argument("--transform", default=None,  help="Path to transform.json (from render_svg.py)")
+    p.add_argument("--out",       default="label-manifest.json")
 
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--labels",        metavar="FILE",  help="Text file, one label per line")
-    g.add_argument("--labels-inline", nargs="+", metavar="LABEL")
+    grp = p.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--labels",        metavar="FILE",
+                     help="Text file, one label per line")
+    grp.add_argument("--labels-inline", nargs="+", metavar="LABEL")
 
     p.add_argument("--layer-priority", nargs="*",
-                   default=["TAGS", "EQUIP", "ANNO", "TEXT"], metavar="LAYER")
-    p.add_argument("--cluster-radius", type=float, default=50.0, metavar="UNITS")
-
-    p.add_argument("--export-png", metavar="PATH", default=None,
-                   help="Render DXF to PNG and save here. Requires ezdxf[draw] + matplotlib.")
-    p.add_argument("--png-dpi", type=int, default=150,
-                   help="DPI for PNG render (default 150)")
+                   default=["TAGS", "EQUIP", "ANNO", "TEXT"],
+                   metavar="LAYER")
+    p.add_argument("--debug-svg", default=None, metavar="PATH",
+                   help="Write debug SVG with red dots at label SVG positions")
+    p.add_argument("--verbose",   action="store_true")
     return p.parse_args()
 
 
-def load_labels(path: str) -> list[str]:
-    with open(path, encoding="utf-8") as f:
+def load_labels_from_file(path: str) -> list[str]:
+    with open(path, "r", encoding="utf-8") as f:
         return [l.strip() for l in f if l.strip() and not l.startswith("#")]
-
-
-def dedup(labels: list[str]) -> list[str]:
-    seen, out = set(), []
-    for l in labels:
-        if l not in seen:
-            seen.add(l); out.append(l)
-    return out
 
 
 def main():
     args = parse_args()
 
-    labels = dedup(load_labels(args.labels) if args.labels else args.labels_inline)
+    target_labels = (load_labels_from_file(args.labels)
+                     if args.labels else args.labels_inline)
 
-    # Optional PNG render — do this before manifest so png_info is available
-    png_info = None
-    if args.export_png:
-        png_info = export_png(args.dxf, args.export_png, dpi=args.png_dpi)
+    # Deduplicate, preserve order
+    seen, unique = set(), []
+    for l in target_labels:
+        if l not in seen:
+            seen.add(l)
+            unique.append(l)
+    if len(unique) < len(target_labels):
+        print(f"Warning: removed {len(target_labels) - len(unique)} duplicate labels")
+
+    # Load transform
+    transform = None
+    if args.transform:
+        with open(args.transform, "r", encoding="utf-8") as f:
+            transform = CoordTransform(json.load(f))
+        print(f"Transform loaded: {args.transform}")
+        if transform.has_png:
+            print(f"  PNG: {transform.png_w}px × {transform.png_h}px  "
+                  f"scale_x={transform.scale_x:.4f} scale_y={transform.scale_y:.4f}")
+        else:
+            print("  PNG dims not present — Leaflet coords will be null")
+    else:
+        print("No --transform provided — coords will be null")
 
     manifest = build_manifest(
         dxf_path=args.dxf,
-        target_labels=labels,
+        svg_path=args.svg,
+        target_labels=unique,
         layer_priority=args.layer_priority,
-        cluster_radius=args.cluster_radius,
-        png_info=png_info,
+        transform=transform,
     )
 
+    # Write manifest
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
-    print(f"\nManifest written → {out_path}")
+    print(f"\nManifest written : {out_path}")
 
-    not_found = [k for k, v in manifest["labels"].items() if not v["found"]]
-    if not_found:
-        print(f"\n⚠  Unmatched ({len(not_found)}): {', '.join(not_found)}")
+    # Write hitboxes.json alongside
+    hitboxes_path = out_path.parent / "hitboxes.json"
+    with open(hitboxes_path, "w", encoding="utf-8") as f:
+        json.dump(manifest["hitboxes"], f, indent=2, ensure_ascii=False)
+    print(f"Hitboxes written : {hitboxes_path}")
 
-    if manifest["potential_matches"]:
-        print(f"\n🔍  Needs review ({len(manifest['potential_matches'])}):")
-        for label, e in manifest["potential_matches"].items():
-            frags = " + ".join(f'"{f["text"]}"' for f in e["cluster"]["fragments"])
-            print(f"   {label}  ←  {frags}")
+    # Debug SVG
+    if args.debug_svg:
+        if not args.svg:
+            print("Warning: --debug-svg requires --svg", file=sys.stderr)
+        elif transform is None:
+            print("Warning: --debug-svg requires --transform", file=sys.stderr)
+        else:
+            write_debug_svg(args.svg, manifest["labels"], args.debug_svg, transform)
+
+    # Unmatched labels
+    missing = [k for k, v in manifest["labels"].items() if not v["found"]]
+    if missing:
+        print(f"\n⚠  Unmatched labels ({len(missing)}):")
+        for label in missing:
+            print(f"   - {label}")
 
 
 if __name__ == "__main__":

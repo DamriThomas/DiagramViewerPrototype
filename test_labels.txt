@@ -1,0 +1,42 @@
+# Test label list for extract_manifest.py
+# Scenarios: exact, split-cluster, duplicate, unmatched, case-fuzzy
+
+# --- Exact matches ---
+FV101
+FV102
+FV103
+HV201
+HV202
+HV203
+EV301
+EV302
+EV303
+CV401
+
+# --- Split-label cluster matches (need proximity grouping) ---
+FV501
+FV502
+HV601
+HV602
+EV701
+EV702
+PSV801
+PSV802
+TCV901
+TCV902
+
+# --- Duplicates ---
+DV001
+DV002
+DV003
+
+# --- Intentionally unmatched (no DXF entity exists) ---
+XX999
+YY888
+ZZ777
+AA001
+BB002
+
+# --- Case-mismatch fuzzy matches ---
+FV111
+HV211

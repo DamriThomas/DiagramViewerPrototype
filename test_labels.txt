@@ -1,5 +1,5 @@
 # Test label list for extract_manifest.py
-# Scenarios: exact, split-cluster, duplicate, unmatched, case-fuzzy
+# Scenarios: exact, split-cluster, duplicate, unmatched, case-fuzzy, triple-fragment
 
 # --- Exact matches ---
 FV101
@@ -40,3 +40,42 @@ BB002
 # --- Case-mismatch fuzzy matches ---
 FV111
 HV211
+
+# --- 3-fragment inverted-T clusters (top + two bottom tokens → two labels) ---
+FV12
+FV54
+HV21
+HV63
+EV30
+EV71
+PSV14
+PSV28
+TCV05
+TCV99
+
+# --- Range clusters (top + 'N TO M' → expanded labels + bare top) ---
+FV
+FV18M
+FV19M
+FV20M
+FV21M
+FV22M
+FV23M
+FV24M
+HV
+HV3M
+HV4M
+HV5M
+HV6M
+HV7M
+EV
+EV1
+EV2
+EV3
+EV4
+PSV
+PSV5A
+PSV6A
+PSV7A
+PSV8A
+PSV9A

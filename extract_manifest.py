@@ -606,7 +606,8 @@ def build_svg_index(svg_entities: list[dict]) -> dict[str, list[dict]]:
 #  Both variants are indexed so match_labels can find either form.
 # ──────────────────────────────────────────────
 
-_DEFAULT_CLUSTER_GAP = 3.5   # × cap-height
+_DEFAULT_CLUSTER_GAP = 3.5   # × cap-height  (vertical)
+_DEFAULT_H_TOLERANCE = 2.5   # × cap-height  (horizontal gate)
 
 
 def _entity_centre(e: dict) -> tuple[float, float]:
@@ -619,13 +620,21 @@ def _entity_centre(e: dict) -> tuple[float, float]:
 
 
 def build_clusters(entities: list[dict],
-                   gap_factor: float = _DEFAULT_CLUSTER_GAP) -> list[list[dict]]:
+                   gap_factor: float = _DEFAULT_CLUSTER_GAP,
+                   h_tolerance: float = _DEFAULT_H_TOLERANCE) -> list[list[dict]]:
     """
     Single-linkage spatial clustering of text entities.
     Returns a list of clusters; each cluster is a list of entities
-    sorted in reading order (descending Y first, then ascending X —
+    sorted in reading order (descending Y first, then ascending X --
     DXF is Y-up so higher Y = higher on page).
-    Only clusters with ≥2 members are returned.
+    Only clusters with >=2 members are returned.
+
+    Proximity is checked on each axis independently:
+      vertical   : dy <= gap_factor  x max(hi, hj)
+      horizontal : dx <= h_tolerance x max(hi, hj)
+
+    Keeping h_tolerance tight (default 2.0) prevents dense horizontal
+    annotation text from bridging unrelated vertical label clusters.
     """
     n = len(entities)
     if n == 0:
@@ -651,11 +660,12 @@ def build_clusters(entities: list[dict],
         hi = entities[i].get("height", 0.0) or 0.0
         for j in range(i + 1, n):
             hj = entities[j].get("height", 0.0) or 0.0
-            threshold = gap_factor * max(hi, hj, 0.001)
+            scale    = max(hi, hj, 0.001)
             cx1, cy1 = centres[i]
             cx2, cy2 = centres[j]
-            dist = math.hypot(cx2 - cx1, cy2 - cy1)
-            if dist <= threshold:
+            dy = abs(cy2 - cy1)
+            dx = abs(cx2 - cx1)
+            if dy <= gap_factor * scale and dx <= h_tolerance * scale:
                 union(i, j)
 
     groups: dict[int, list[int]] = defaultdict(list)
@@ -666,7 +676,7 @@ def build_clusters(entities: list[dict],
     for members in groups.values():
         if len(members) < 2:
             continue
-        # Reading order: high Y first (top of page), then left→right
+        # Reading order: high Y first (top of page), then left-to-right
         sorted_members = sorted(
             members,
             key=lambda i: (-round(centres[i][1], 2), centres[i][0])
@@ -704,23 +714,151 @@ def merge_dxf_bboxes(bboxes: list[dict]) -> dict:
     }
 
 
+def _inverted_t_variants(cluster: list[dict]) -> set[str]:
+    """
+    Detect an "inverted-T" cluster: one token on a distinct top row and two or
+    more tokens sharing a lower row.  Returns label candidates formed by pairing
+    the top token with each bottom token individually (both concat and spaced).
+
+    Layout (Y-up, so top row has the HIGHEST Y value):
+
+        "FV"          ← top token  (y ≈ row_top)
+    "12"    "54"      ← bottom tokens (y ≈ row_bottom, separated in X)
+
+    Produces: {"FV12", "FV 12", "FV54", "FV 54"}
+
+    Falls back to an empty set when the cluster doesn't match the pattern.
+    """
+    if len(cluster) < 3:
+        return set()
+
+    centres = [_entity_centre(e) for e in cluster]
+
+    # Round Y to 1 decimal place so small jitter doesn't create phantom rows
+    y_vals = [round(cy, 1) for _, cy in centres]
+    unique_ys = sorted(set(y_vals), reverse=True)   # highest Y first (= top row)
+
+    if len(unique_ys) < 2:
+        return set()   # all on same row — not the pattern we're looking for
+
+    top_row_y    = unique_ys[0]
+    bottom_row_y = unique_ys[1]
+
+    top_tokens    = [e["text"].strip() for e, y in zip(cluster, y_vals) if y == top_row_y]
+    bottom_tokens = [e["text"].strip() for e, y in zip(cluster, y_vals) if y == bottom_row_y]
+
+    # Classic inverted-T: exactly one top token, two or more bottom tokens
+    if len(top_tokens) != 1 or len(bottom_tokens) < 2:
+        return set()
+
+    top = top_tokens[0]
+    variants: set[str] = set()
+    for bt in bottom_tokens:
+        variants.add(f"{top}{bt}")        # "FV12"
+        variants.add(f"{top} {bt}")       # "FV 12"
+    return variants
+
+
+# Matches "18M TO 24M", "3 TO 7", "1A TO 5A" etc.
+# Numeric part must be at the START of each token (per spec).
+_RANGE_RE = re.compile(
+    r"^(\d+)(\w*)\s+TO\s+(\d+)(\w*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _range_variants(cluster: list[dict]) -> set[str]:
+    """
+    Detect an inverted-T cluster whose single bottom entity is a range expression
+    like "18M TO 24M".  Returns one label per step in the range, plus the bare
+    top token as a standalone label.
+
+    Layout:
+            "FV"
+        "18M TO 24M"
+
+    Produces: {"FV", "FV18M", "FV19M", ..., "FV24M"}
+
+    Rules:
+      - Exactly one top-row token (the prefix).
+      - Exactly one bottom-row token matching _RANGE_RE.
+      - Start and end suffixes must match (both "M", both "", etc.).
+      - Start number must be <= end number; range capped at 200 steps to
+        guard against malformed data.
+    """
+    if len(cluster) < 2:
+        return set()
+
+    centres  = [_entity_centre(e) for e in cluster]
+    y_vals   = [round(cy, 1) for _, cy in centres]
+    unique_ys = sorted(set(y_vals), reverse=True)   # highest Y first
+
+    if len(unique_ys) < 2:
+        return set()
+
+    top_row_y    = unique_ys[0]
+    bottom_row_y = unique_ys[1]
+
+    top_tokens    = [e["text"].strip() for e, y in zip(cluster, y_vals) if y == top_row_y]
+    bottom_tokens = [e["text"].strip() for e, y in zip(cluster, y_vals) if y == bottom_row_y]
+
+    # Need exactly one top token; scan all bottom tokens for a range match
+    # (there may be extra noise tokens on the same row -- skip them)
+    if len(top_tokens) != 1 or len(bottom_tokens) == 0:
+        return set()
+
+    m = None
+    for bt in bottom_tokens:
+        m = _RANGE_RE.match(bt)
+        if m:
+            break
+    if not m:
+        return set()
+
+    start_num, start_sfx, end_num, end_sfx = m.group(1), m.group(2), m.group(3), m.group(4)
+
+    # Suffixes must match (case-insensitive)
+    if start_sfx.upper() != end_sfx.upper():
+        return set()
+
+    start_i, end_i = int(start_num), int(end_num)
+    if start_i > end_i or (end_i - start_i) > 200:
+        return set()
+
+    top    = top_tokens[0]
+    suffix = start_sfx                        # preserve original capitalisation
+    variants: set[str] = {top}                # top token is also a standalone label
+    for n in range(start_i, end_i + 1):
+        variants.add(f"{top}{n}{suffix}")     # "FV18M", "FV19M", ...
+    return variants
+
+
 def build_cluster_index(entities: list[dict],
-                        gap_factor: float = _DEFAULT_CLUSTER_GAP
+                        gap_factor: float = _DEFAULT_CLUSTER_GAP,
+                        h_tolerance: float = _DEFAULT_H_TOLERANCE
                         ) -> dict[str, list[list[dict]]]:
     """
     Build a lookup: joined_text → [cluster, cluster, ...]
     Tries both no-separator and space-separator joins.
     Also tries case-insensitive variants (stored under the upper-case key).
+    Handles inverted-T clusters (shared top token + sibling bottom tokens)
+    by indexing each top+bottom pair as an additional candidate.
+    Handles range expressions ("18M TO 24M") by expanding to individual labels.
     """
-    clusters = build_clusters(entities, gap_factor)
+    clusters = build_clusters(entities, gap_factor, h_tolerance)
     index: dict[str, list[list[dict]]] = defaultdict(list)
 
     for cluster in clusters:
         parts = [e["text"].strip() for e in cluster]
-        variants = {
+        variants: set[str] = {
             "".join(parts),          # TCV901
             " ".join(parts),         # TCV 901
         }
+        # Inverted-T: top + multiple discrete bottom tokens -> top+each
+        variants |= _inverted_t_variants(cluster)
+        # Range expression: top + "18M TO 24M" -> top+each step + bare top
+        variants |= _range_variants(cluster)
+
         for v in variants:
             if v:
                 index[v].append(cluster)
@@ -1063,6 +1201,7 @@ def build_manifest(
     layer_priority: list[str],
     transform:      CoordTransform | None,
     cluster_gap:    float = _DEFAULT_CLUSTER_GAP,
+    h_tolerance:    float = _DEFAULT_H_TOLERANCE,
 ) -> dict:
     print(f"[1/4] Reading DXF: {dxf_path}")
     dxf_entities = extract_dxf_text_entities(dxf_path)
@@ -1081,8 +1220,8 @@ def build_manifest(
     print(f"[3/4] Matching {len(target_labels)} labels...")
     dxf_index     = build_dxf_index(dxf_entities)
     svg_index     = build_svg_index(svg_entities)
-    cluster_index = build_cluster_index(dxf_entities, gap_factor=cluster_gap)
-    print(f"      → {len(cluster_index)} cluster variants indexed  (gap={cluster_gap}×h)")
+    cluster_index = build_cluster_index(dxf_entities, gap_factor=cluster_gap, h_tolerance=h_tolerance)
+    print(f"      -> {len(cluster_index)} cluster variants indexed  (gap={cluster_gap}x h_tol={h_tolerance}x h)")
     labels        = match_labels(target_labels, dxf_index, svg_index,
                                  cluster_index, layer_priority, transform)
 
@@ -1159,8 +1298,12 @@ def parse_args():
                    help="Write debug SVG with tight hitbox rectangles at label positions")
     p.add_argument("--cluster-gap", type=float, default=_DEFAULT_CLUSTER_GAP,
                    metavar="N",
-                   help=f"Proximity threshold for multi-part label clustering "
-                        f"(× cap-height, default {_DEFAULT_CLUSTER_GAP})")
+                   help=f"Vertical proximity threshold for clustering "
+                        f"(x cap-height, default {_DEFAULT_CLUSTER_GAP})")
+    p.add_argument("--h-tolerance", type=float, default=_DEFAULT_H_TOLERANCE,
+                   metavar="N",
+                   help=f"Horizontal proximity gate for clustering "
+                        f"(x cap-height, default {_DEFAULT_H_TOLERANCE})")
     p.add_argument("--verbose",   action="store_true")
     return p.parse_args()
 
@@ -1206,6 +1349,7 @@ def main():
         layer_priority=args.layer_priority,
         transform=transform,
         cluster_gap=args.cluster_gap,
+        h_tolerance=args.h_tolerance,
     )
 
     # Write manifest

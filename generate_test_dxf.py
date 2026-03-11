@@ -9,6 +9,8 @@ in extract_manifest.py:
   • Duplicates           – same label appears on two different layers
   • Unmatched            – labels in the target list with NO DXF text at all
   • Noise text           – annotation text that should NOT match anything
+  • 3-fragment clusters  – top token + two tokens side-by-side below (inverted-T layout)
+                           e.g. "FV" above, then "12" and "54" on the row below
 
 Run:
     pip install ezdxf
@@ -187,6 +189,104 @@ for dxf_text, target_label, layer, x, y in case_fittings:
     add_text(msp, dxf_text, x, y + 8, "TEXT-ALL")  # lowercase in DXF
 
 
+# ── Centre-alignment helpers for multi-part clusters ─────────────────────────
+
+def estimate_text_width(text, height=TEXT_HEIGHT):
+    """Rough advance width in model units (matches extractor glyph table)."""
+    DEFAULT = 0.74
+    glyph = {"I":0.34,"i":0.32,"l":0.32,"1":0.46," ":0.38,"f":0.50,"r":0.52,"t":0.54}
+    return sum(glyph.get(c, DEFAULT) for c in text) * height
+
+
+def add_text_centred(msp, text, cx, y, layer, height=TEXT_HEIGHT):
+    """Place TEXT so its visual centre lands on cx (left-align with insert offset)."""
+    insert_x = cx - estimate_text_width(text, height) / 2
+    add_text(msp, text, insert_x, y, layer, height)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO G – 3-FRAGMENT "INVERTED-T" CLUSTERS
+#
+# Layout (model space, y increases upward):
+#
+#         [  top  ]            ← 1 TEXT entity: the shared prefix/type code
+#     [ left ] [ right ]       ← 2 TEXT entities side-by-side one row below
+#
+# The two bottom tokens together form a compound suffix that, combined with
+# the top token, produce two distinct target labels:
+#
+#   top="FV",  left="12", right="54"  →  targets "FV12" and "FV54"
+#
+# This exercises a matcher that must:
+#   1. Cluster all three fragments into one spatial group.
+#   2. Recognise that the group represents *two* labels sharing a prefix.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each entry: (top_text, left_num, right_num, layer, anchor_x, anchor_y)
+# The two generated target labels are  f"{top}{left}"  and  f"{top}{right}".
+triple_fittings = [
+    ("FV",  "12", "54", "SYS-PIPING",  100,  550),
+    ("HV",  "21", "63", "SYS-HVAC",    250,  550),
+    ("EV",  "30", "71", "SYS-ELEC",    400,  550),
+    ("PSV", "14", "28", "SYS-PIPING",  550,  550),
+    ("TCV", "05", "99", "SYS-PIPING",  700,  550),
+]
+
+# Horizontal gap between the two bottom tokens (centre-to-centre)
+BOTTOM_SPREAD = TEXT_HEIGHT * 4.0
+# Vertical drop from the top token baseline to the bottom-row baseline
+TOP_TO_BOTTOM = SPLIT_OFFSET           # reuse the same spacing as 2-fragment splits
+
+triple_labels = []
+for top, left_num, right_num, layer, ax, ay in triple_fittings:
+    label_left  = f"{top}{left_num}"
+    label_right = f"{top}{right_num}"
+    triple_labels.append(label_left)
+    triple_labels.append(label_right)
+
+    # Draw two small fitting icons side-by-side to match the two labels
+    add_fitting_icon(msp, ax - BOTTOM_SPREAD / 2, ay, layer)
+    add_fitting_icon(msp, ax + BOTTOM_SPREAD / 2, ay, layer)
+
+    # Top fragment – visually centred over the midpoint of the two bottom tokens
+    add_text_centred(msp, top,      ax,                    ay + 8,                "TEXT-ALL")
+    # Bottom-left and bottom-right – each centred over its own icon
+    add_text_centred(msp, left_num, ax - BOTTOM_SPREAD / 2, ay + 8 - TOP_TO_BOTTOM, "TEXT-ALL")
+    add_text_centred(msp, right_num,ax + BOTTOM_SPREAD / 2, ay + 8 - TOP_TO_BOTTOM, "TEXT-ALL")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCENARIO H – RANGE CLUSTERS  (top token + single "N TO M" bottom entity)
+#
+# Layout:
+#           "FV"
+#       "18M TO 24M"
+#
+# The matcher should expand this to FV18M, FV19M, ... FV24M,
+# plus "FV" itself as a standalone label.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each entry: (top, start_n, end_n, suffix, layer, anchor_x, anchor_y)
+range_fittings = [
+    ("FV",  18, 24, "M",  "SYS-PIPING",  100,  650),
+    ("HV",   3,  7, "M",  "SYS-HVAC",    300,  650),
+    ("EV",   1,  4, "",   "SYS-ELEC",    500,  650),   # no suffix — bare numbers
+    ("PSV",  5,  9, "A",  "SYS-PIPING",  700,  650),
+]
+
+range_labels = []
+for top, start_n, end_n, sfx, layer, ax, ay in range_fittings:
+    range_labels.append(top)                            # standalone top label
+    for n in range(start_n, end_n + 1):
+        range_labels.append(f"{top}{n}{sfx}")
+
+    add_fitting_icon(msp, ax, ay, layer)
+    # Top token and range string both visually centred on ax
+    range_str = f"{start_n}{sfx} TO {end_n}{sfx}"
+    add_text_centred(msp, top,       ax, ay + 8,                "TEXT-ALL")
+    add_text_centred(msp, range_str, ax, ay + 8 - SPLIT_OFFSET, "TEXT-ALL")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Assemble full target label list and write files
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,6 +296,8 @@ all_labels = (
     + duplicate_labels
     + unmatched_labels
     + case_labels
+    + triple_labels
+    + range_labels
 )
 
 # Write DXF
@@ -205,9 +307,9 @@ print(f"✓  DXF written: {dxf_path}")
 
 # Write label list
 labels_path = "test_labels.txt"
-with open(labels_path, "w") as f:
+with open(labels_path, "w", encoding="utf-8") as f:
     f.write("# Test label list for extract_manifest.py\n")
-    f.write("# Scenarios: exact, split-cluster, duplicate, unmatched, case-fuzzy\n\n")
+    f.write("# Scenarios: exact, split-cluster, duplicate, unmatched, case-fuzzy, triple-fragment\n\n")
     f.write("# --- Exact matches ---\n")
     for label, _, __, ___ in exact_fittings:
         f.write(f"{label}\n")
@@ -223,6 +325,12 @@ with open(labels_path, "w") as f:
     f.write("\n# --- Case-mismatch fuzzy matches ---\n")
     for lbl in case_labels:
         f.write(f"{lbl}\n")
+    f.write("\n# --- 3-fragment inverted-T clusters (top + two bottom tokens → two labels) ---\n")
+    for lbl in triple_labels:
+        f.write(f"{lbl}\n")
+    f.write("\n# --- Range clusters (top + 'N TO M' → expanded labels + bare top) ---\n")
+    for lbl in range_labels:
+        f.write(f"{lbl}\n")
 
 print(f"✓  Label list written: {labels_path}")
 print(f"\nLabel counts:")
@@ -231,10 +339,12 @@ print(f"  Split cluster candidates: {len(split_labels)}")
 print(f"  Duplicate candidates   : {len(duplicate_labels)}")
 print(f"  Intentionally unmatched: {len(unmatched_labels)}")
 print(f"  Case-mismatch (fuzzy)  : {len(case_labels)}")
+print(f"  3-fragment clusters    : {len(triple_labels)}  ({len(triple_fittings)} groups × 2 labels)")
+print(f"  Range clusters         : {len(range_labels)}  ({len(range_fittings)} groups, expanded)")
 print(f"  Total labels           : {len(all_labels)}")
 print(f"\nNext step:")
 print(f"  python extract_manifest.py \\")
 print(f"      --dxf {dxf_path} \\")
 print(f"      --labels {labels_path} \\")
-print(f"      --cluster-radius 60 \\")
+print(f"      --cluster-gap 3.5 \\")
 print(f"      --out test_manifest.json")
